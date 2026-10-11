@@ -10,6 +10,7 @@ Mỗi mục giải mã kèm trạng thái:
 """
 
 import codecs
+import html
 import re
 import urllib.parse
 from typing import Any, NamedTuple
@@ -121,6 +122,28 @@ def decode_form(body: str, max_len: int = MAX_DECODED) -> Decoded:
     return _result(fields, reasons)
 
 
+def _is_text_content(content_type: str) -> bool:
+    """Body dạng văn bản có thể chứa HTML entity: text/html, text/plain, application/xhtml+xml..."""
+    content_type = content_type.lower()
+    return content_type.startswith("text/") or "xml" in content_type
+
+
+def html_unescape(text: str, max_len: int = MAX_DECODED) -> Decoded:
+    """Giải HTML entity: &lt;script&gt; -> <script>
+
+    Nhận cả dạng tên (&lt;), số (&#60;), hex (&#x3c;) và dạng thiếu dấu chấm phẩy (&lt) như trình
+    duyệt, vì kẻ tấn công dùng đúng những biến thể đó để né bộ lọc chỉ tìm "&lt;".
+    """
+    reasons = []
+    value = html.unescape(text)
+    if REPLACEMENT in value and REPLACEMENT not in text:
+        reasons.append("có mã ký tự không hợp lệ (ví dụ &#0;), đã thay bằng ký tự thay thế")
+    if len(value) > max_len:
+        value = value[:max_len]
+        reasons.append(f"cắt còn {max_len} ký tự")
+    return _result(value, reasons)
+
+
 def decode_payload(payload_hex: str, truncated: bool = False,
                    max_len: int = MAX_DECODED) -> tuple[Decoded, str | None]:
     """Payload tầng transport (Bài 1 ghi dạng hex) -> (chuỗi, bảng mã nhận ra được).
@@ -165,8 +188,11 @@ def decode_http(http: dict, max_len: int = MAX_DECODED) -> dict:
             _put(out, "query", decode_form(query, max_len))
 
     body = http.get("file_data")
-    if body and FORM_CONTENT_TYPE in http.get("content_type", "").lower():
+    content_type = http.get("content_type", "")
+    if body and FORM_CONTENT_TYPE in content_type.lower():
         _put(out, "form", decode_form(body, max_len))
+    elif body and _is_text_content(content_type):
+        _put(out, "body_text", html_unescape(body, max_len))
 
     return out
 
