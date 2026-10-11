@@ -9,9 +9,12 @@ Mỗi mục giải mã kèm trạng thái:
     error    không giải mã được
 """
 
+import base64
+import binascii
 import codecs
 import email
 import html
+import quopri
 import re
 import urllib.parse
 from typing import Any, NamedTuple
@@ -28,6 +31,9 @@ _BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
 # Dấu = không theo sau bởi 2 chữ số hex và không phải ngắt dòng mềm ("=" ở cuối dòng):
 # không phải quoted-printable hợp lệ
 _BAD_QP = re.compile(r"=(?![0-9A-Fa-f]{2}|\r?$)", re.MULTILINE)
+
+# Encoded-word trong header thư (RFC 2047): =?charset?B?base64?= hoặc =?charset?Q?quoted?=
+_ENCODED_WORD = re.compile(r"=\?([^?\s]+)\?([BbQq])\?([^?\s]*)\?=")
 
 # Content-Transfer-Encoding mà module email của Python giải được (RFC 2045 và uuencode)
 _KNOWN_CTE = {"7bit", "8bit", "binary", "base64", "quoted-printable",
@@ -215,6 +221,56 @@ def decode_mime(message: str, truncated: bool = False,
     return _result(body, reasons), parts
 
 
+def decode_mime_header(value: str, max_len: int = MAX_DECODED) -> Decoded:
+    """Giải encoded-word trong header thư: =?UTF-8?B?SMOzYSDEkcahbg==?= -> Hóa đơn
+
+    B là base64, Q gần giống quoted-printable (dấu _ là dấu cách). Thư lừa đảo hay mã hóa Subject
+    để né bộ lọc từ khóa. Không dùng email.header.decode_header vì hàm đó đổi phần không mã hóa
+    sang byte bằng raw-unicode-escape: chữ có dấu thành \\uXXXX, đổi ngược thì hỏng dấu \\ thật.
+    Ở đây phần không mã hóa được giữ nguyên.
+    """
+    out, reasons = [], []
+    pos, after_word = 0, False
+    for m in _ENCODED_WORD.finditer(value):
+        gap = value[pos:m.start()]
+        if not (after_word and gap.isspace()):    # Khoảng trắng giữa hai encoded-word bị bỏ (mục 6.2)
+            out.append(gap)
+        charset, kind, text = m.groups()
+        try:
+            if kind in "Bb":
+                data = base64.b64decode(text + "=" * (-len(text) % 4), validate=True)
+            else:
+                data = quopri.decodestring(text.encode("ascii"), header=True)
+        except (binascii.Error, ValueError):     # Gồm cả UnicodeEncodeError khi có ký tự ngoài ASCII
+            out.append(m.group(0))
+            reasons.append(f"encoded-word hỏng, giữ nguyên: {m.group(0)}")
+        else:
+            # RFC 2231 cho phép thêm ngôn ngữ sau dấu *, ví dụ utf-8*vi
+            word = decode_text(data, charset.split("*")[0], max_len)
+            out.append(word.value)
+            if word.reason:
+                reasons.append(word.reason)
+        pos, after_word = m.end(), True
+    out.append(value[pos:])
+
+    result = "".join(out)
+    if len(result) > max_len:
+        result = result[:max_len]
+        reasons.append(f"cắt còn {max_len} ký tự")
+    return _result(result, reasons)
+
+
+def decode_mail_headers(headers: dict, max_len: int = MAX_DECODED) -> Decoded:
+    """Giải các header thư mà parser SMTP của Bài 1 đã lấy (from, to, subject...)."""
+    values, reasons = {}, []
+    for name, raw in headers.items():
+        result = decode_mime_header(raw, max_len)
+        values[name] = result.value
+        if result.reason:
+            reasons.append(f"{name}: {result.reason}")
+    return _result(values, reasons)
+
+
 def decode_payload(payload_hex: str, truncated: bool = False,
                    max_len: int = MAX_DECODED) -> tuple[Decoded, str | None]:
     """Payload tầng transport (Bài 1 ghi dạng hex) -> (chuỗi, bảng mã nhận ra được).
@@ -277,6 +333,8 @@ def decode_event(event: dict, max_len: int = MAX_DECODED) -> None:
 
         mail = (event.get("smtp") or {}).get("data")
         if mail and mail.get("message"):
+            if mail.get("headers"):
+                _put(out, "mail_headers", decode_mail_headers(mail["headers"], max_len))
             mime = decode_mime(mail["message"], mail.get("message_truncated", False), max_len)
             if mime:
                 _put(out, "mail_body", mime[0])
