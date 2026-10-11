@@ -10,12 +10,14 @@ Mỗi mục giải mã kèm trạng thái:
 """
 
 import codecs
+import email
 import html
 import re
 import urllib.parse
 from typing import Any, NamedTuple
 
 MAX_DECODED = 4096          # Số ký tự tối đa của một mục đã giải mã
+MAX_MIME_PARTS = 64         # Số phần MIME tối đa xét trong một thư
 
 OK, PARTIAL, ERROR = "ok", "partial", "error"
 
@@ -23,6 +25,13 @@ REPLACEMENT = "�"      # Ký tự U+FFFD mà bộ giải mã chèn vào chỗ 
 
 # Dấu % không theo sau bởi 2 chữ số hex: không phải percent-encoding hợp lệ
 _BAD_PERCENT = re.compile(r"%(?![0-9A-Fa-f]{2})")
+# Dấu = không theo sau bởi 2 chữ số hex và không phải ngắt dòng mềm ("=" ở cuối dòng):
+# không phải quoted-printable hợp lệ
+_BAD_QP = re.compile(r"=(?![0-9A-Fa-f]{2}|\r?$)", re.MULTILINE)
+
+# Content-Transfer-Encoding mà module email của Python giải được (RFC 2045 và uuencode)
+_KNOWN_CTE = {"7bit", "8bit", "binary", "base64", "quoted-printable",
+              "x-uuencode", "uuencode", "uue", "x-uue"}
 
 FORM_CONTENT_TYPE = "application/x-www-form-urlencoded"
 
@@ -144,6 +153,68 @@ def html_unescape(text: str, max_len: int = MAX_DECODED) -> Decoded:
     return _result(value, reasons)
 
 
+def decode_mime(message: str, truncated: bool = False,
+                max_len: int = MAX_DECODED) -> tuple[Decoded, list[dict]] | None:
+    """Giải nội dung thư MIME theo Content-Transfer-Encoding (base64, quoted-printable).
+
+    Trả về (thân thư dạng chữ, thông tin từng phần MIME), hoặc None nếu đoạn thư không có
+    header: Bài 1 xử lý từng gói, gói ở giữa thư không chứa header nên không biết encoding.
+    Phần không phải văn bản (file đính kèm) chỉ ghi loại, tên và kích thước, không đưa vào thân thư.
+    truncated=True khi Bài 1 đã cắt bớt nội dung thư.
+    """
+    # Bài 1 lưu thư dạng chuỗi UTF-8; encode lại thành byte để module email giải thân thư 8bit
+    # đúng như byte gốc (đưa chuỗi vào thẳng thì ký tự ngoài ASCII bị mã hóa sai).
+    msg = email.message_from_bytes(message.encode("utf-8", "replace"))
+    if not msg.keys():
+        return None
+
+    texts, parts, reasons = [], [], []
+    for part in msg.walk():
+        if part.is_multipart():
+            continue
+        if len(parts) == MAX_MIME_PARTS:
+            reasons.append(f"chỉ xét {MAX_MIME_PARTS} phần đầu của thư")
+            break
+        encoding = str(part.get("Content-Transfer-Encoding", "7bit")).strip().lower()
+        # Base64 hỏng không ném lỗi: module email giải phần đọc được và ghi lỗi vào part.defects
+        data = part.get_payload(decode=True) or b""
+        info = {"content_type": part.get_content_type(), "encoding": encoding, "size": len(data)}
+        if part.get_filename():
+            info["filename"] = part.get_filename()
+
+        part_reasons = []
+        if encoding not in _KNOWN_CTE:
+            part_reasons.append(f"không biết Content-Transfer-Encoding {encoding!r}, giữ nguyên")
+        elif encoding == "quoted-printable" and _BAD_QP.search(str(part.get_payload())):
+            part_reasons.append("có dấu = không phải mã quoted-printable hợp lệ, giữ nguyên")
+        part_reasons += [type(d).__name__ for d in part.defects]
+        if part.get_content_maintype() == "text":
+            charset = part.get_content_charset() or "utf-8"
+            text = decode_text(data, charset, max_len, complete=not truncated)
+            info["charset"] = charset
+            texts.append(text.value)
+            if text.reason:
+                part_reasons.append(text.reason)
+
+        info["decode_status"] = PARTIAL if part_reasons else OK
+        if part_reasons:
+            info["reason"] = "; ".join(part_reasons)
+            reasons.append(f"phần {len(parts) + 1}: {info['reason']}")
+        parts.append(info)
+
+    if msg.is_multipart():
+        # Lỗi cấu trúc của cả thư, ví dụ thiếu boundary kết thúc. Thư một phần thì msg chính là
+        # phần duy nhất, lỗi của nó đã được tính ở trên.
+        reasons += [f"thư: {type(d).__name__}" for d in msg.defects]
+    if truncated:
+        reasons.append("nội dung thư đã bị Bài 1 cắt bớt")
+    body = "\n".join(texts)
+    if len(body) > max_len:
+        body = body[:max_len]
+        reasons.append(f"cắt còn {max_len} ký tự")
+    return _result(body, reasons), parts
+
+
 def decode_payload(payload_hex: str, truncated: bool = False,
                    max_len: int = MAX_DECODED) -> tuple[Decoded, str | None]:
     """Payload tầng transport (Bài 1 ghi dạng hex) -> (chuỗi, bảng mã nhận ra được).
@@ -203,6 +274,13 @@ def decode_event(event: dict, max_len: int = MAX_DECODED) -> None:
         out: dict = {}
         if "http" in event:
             out.update(decode_http(event["http"], max_len))
+
+        mail = (event.get("smtp") or {}).get("data")
+        if mail and mail.get("message"):
+            mime = decode_mime(mail["message"], mail.get("message_truncated", False), max_len)
+            if mime:
+                _put(out, "mail_body", mime[0])
+                out["mail_parts"] = mime[1]
 
         layer = event.get("tcp") or event.get("udp")
         if event.get("app_protocol") in TEXT_PROTOCOLS and layer and layer.get("payload"):
