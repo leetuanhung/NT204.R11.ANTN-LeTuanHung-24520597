@@ -284,10 +284,13 @@ def decode_payload(payload_hex: str, truncated: bool = False,
         return Decoded("", ERROR, f"payload hex không hợp lệ: {exc}"), None
 
     result = decode_text(data, max_len=max_len, complete=not truncated)
-    if data.isascii():
-        charset = "ascii"
-    else:
-        charset = "utf-8" if result.status == OK else "binary"
+    # Kiểm tra trên byte, không dựa vào result.status: status còn là partial khi chuỗi chỉ bị cắt
+    # vì quá max_len, trong khi byte vẫn là UTF-8 hợp lệ
+    try:
+        codecs.getincrementaldecoder("utf-8")().decode(data, final=not truncated)
+        charset = "ascii" if data.isascii() else "utf-8"
+    except UnicodeDecodeError:
+        charset = "binary"
     if truncated:
         reasons = [result.reason] if result.reason else []
         reasons.append(f"chỉ có {len(data)} byte đầu của payload")
