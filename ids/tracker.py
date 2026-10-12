@@ -17,9 +17,14 @@ Trạng thái TCP (mục 5.2), cập nhật theo cờ SYN, ACK, FIN, RST:
     CLOSING      một phía đã gửi FIN
     CLOSED       cả hai phía đã gửi FIN
     RESET        có RST
+
+Idle timeout (mục 5.3): flow không có gói mới quá thời gian quy định thì được kết thúc, xuất ra
+và xóa khỏi bảng flow đang hoạt động. Đồng hồ là timestamp của gói chứ không phải giờ máy, nên
+đọc lại một file PCAP cho đúng kết quả như lúc bắt gói thật.
 """
 
 import ipaddress
+from collections import OrderedDict
 from dataclasses import dataclass
 
 FORWARD, BACKWARD = "forward", "backward"
@@ -28,6 +33,23 @@ TRACKED_PROTOCOLS = {"TCP", "UDP"}
 NEW, HANDSHAKE, ESTABLISHED = "NEW", "HANDSHAKE", "ESTABLISHED"
 CLOSING, CLOSED, RESET = "CLOSING", "CLOSED", "RESET"
 TERMINAL_STATES = {CLOSED, RESET}
+
+# Lý do flow kết thúc
+IDLE_TIMEOUT = "idle_timeout"            # Quá thời gian không có gói mới
+CONNECTION_CLOSED = "connection_closed"  # TCP đã CLOSED/RESET và hết thời gian chờ gói cuối
+PORT_REUSED = "port_reused"              # SYN mới trên 5-tuple của kết nối đã đóng
+END_OF_INPUT = "end_of_input"            # Hết dữ liệu đầu vào (hết file, dừng bắt gói)
+
+TCP_TIMEOUT = 300.0     # Giây
+UDP_TIMEOUT = 60.0
+CLOSED_TIMEOUT = 10.0   # Giữ thêm flow đã đóng để ACK cuối, gói gửi lại không tạo nhầm flow mới
+
+
+@dataclass
+class TrackerConfig:
+    tcp_timeout: float = TCP_TIMEOUT
+    udp_timeout: float = UDP_TIMEOUT
+    closed_timeout: float = CLOSED_TIMEOUT
 
 Endpoint = tuple[str, int]          # (IP, port)
 FlowKey = tuple[str, Endpoint, Endpoint]
@@ -46,6 +68,12 @@ class Flow:
     syn_ack_seen: bool = False      # Server đã trả lời SYN/ACK
     fin_forward: bool = False       # A đã gửi FIN
     fin_backward: bool = False      # B đã gửi FIN
+    end_reason: str | None = None   # Lý do kết thúc, None khi flow còn hoạt động
+
+
+def _queue_name(flow: Flow) -> str:
+    """Hàng đợi theo mức timeout: TCP, UDP, hoặc TCP đã đóng."""
+    return "closed" if flow.state in TERMINAL_STATES else flow.protocol.lower()
 
 
 def _tcp_flags(event: dict) -> dict:
@@ -138,29 +166,61 @@ def _five_tuple(event: dict) -> tuple[str, Endpoint, Endpoint, float] | None:
 
 
 class FlowTracker:
-    """Bảng flow đang hoạt động. Mỗi event gọi process() một lần."""
+    """Bảng flow đang hoạt động. Mỗi event gọi process() một lần; hết dữ liệu thì gọi flush()."""
 
-    def __init__(self) -> None:
+    def __init__(self, cfg: TrackerConfig | None = None) -> None:
+        self.cfg = cfg or TrackerConfig()
         self.flows: dict[FlowKey, Flow] = {}
+        # Mỗi hàng đợi giữ khóa flow theo thứ tự lần cuối có gói, flow lâu không hoạt động nhất ở đầu.
+        # Mỗi hàng có một mức timeout nên quét hết hạn chỉ cần xem từ đầu hàng, không duyệt cả bảng.
+        self._queues: dict[str, OrderedDict[FlowKey, None]] = {
+            "tcp": OrderedDict(), "udp": OrderedDict(), "closed": OrderedDict()}
+        self.now = 0.0          # Timestamp lớn nhất đã thấy: đồng hồ của tracker
+
+    def _end(self, key: FlowKey, reason: str) -> Flow:
+        """Xóa flow khỏi bảng đang hoạt động và ghi lý do kết thúc."""
+        flow = self.flows.pop(key)
+        self._queues[_queue_name(flow)].pop(key, None)
+        flow.end_reason = reason
+        return flow
+
+    def expire(self, now: float) -> list[Flow]:
+        """Kết thúc các flow không có gói mới quá timeout, tính đến thời điểm now."""
+        self.now = max(self.now, now)
+        timeouts = {"tcp": self.cfg.tcp_timeout, "udp": self.cfg.udp_timeout,
+                    "closed": self.cfg.closed_timeout}
+        finished = []
+        for name, timeout in timeouts.items():
+            queue = self._queues[name]
+            while queue:
+                key = next(iter(queue))
+                if self.now - self.flows[key].last_seen <= timeout:
+                    break
+                finished.append(self._end(key, CONNECTION_CLOSED if name == "closed" else IDLE_TIMEOUT))
+        return finished
 
     def process(self, event: dict) -> list[Flow]:
-        """Gắn event vào flow có sẵn hoặc tạo flow mới; thêm flow_id và flow_direction vào event.
+        """Gắn event vào flow có sẵn hoặc tạo flow mới; thêm flow_id, flow_direction, flow_state.
 
-        Trả về các flow đã kết thúc trong lần gọi này để nơi gọi ghi ra.
+        Trả về các flow đã kết thúc trong lần gọi này (hết hạn, dùng lại port) để nơi gọi ghi ra.
         """
         event["flow_id"] = event["flow_direction"] = event["flow_state"] = None
+        # Mọi gói có thời gian hợp lệ đều đẩy đồng hồ, kể cả gói không thuộc flow nào (ARP, ICMP)
+        norm = event.get("norm")
+        timestamp = norm.get("timestamp") if isinstance(norm, dict) else None
+        finished = self.expire(timestamp) if isinstance(timestamp, (int, float)) else []
+
         five_tuple = _five_tuple(event)
         if five_tuple is None:
-            return []
+            return finished
         protocol, src, dst, timestamp = five_tuple
         flags = _tcp_flags(event) if protocol == "TCP" else {}
-        finished = []
 
         key = flow_key(protocol, src, dst)
         flow = self.flows.get(key)
         if flow and flow.state in TERMINAL_STATES and flags.get("syn") and not flags.get("ack"):
             # SYN mới trên 5-tuple đã đóng: phiên mới dùng lại port, kết thúc flow cũ
-            finished.append(self.flows.pop(key))
+            finished.append(self._end(key, PORT_REUSED))
             flow = None
         if flow is None:
             a, b = _initiator(event, src, dst)
@@ -168,12 +228,16 @@ class FlowTracker:
             if protocol == "TCP":
                 flow.state = NEW
             self.flows[key] = flow
+        else:
+            self._queues[_queue_name(flow)].pop(key)
 
         direction = FORWARD if src == flow.endpoint_a else BACKWARD
         flow.last_seen = max(flow.last_seen, timestamp)   # Gói đến trễ không kéo lùi thời gian
         flow.packet_count += 1
         if protocol == "TCP":
             update_tcp_state(flow, flags, direction)
+        # Xếp lại cuối hàng; trạng thái mới có thể chuyển flow sang hàng "closed"
+        self._queues[_queue_name(flow)][key] = None
 
         event["flow_id"] = flow.flow_id
         event["flow_direction"] = direction
@@ -181,7 +245,5 @@ class FlowTracker:
         return finished
 
     def flush(self) -> list[Flow]:
-        """Kết thúc mọi flow còn lại (hết dữ liệu đầu vào). Trả về các flow đó."""
-        flows = list(self.flows.values())
-        self.flows.clear()
-        return flows
+        """Kết thúc mọi flow còn lại khi hết dữ liệu đầu vào. Trả về các flow đó."""
+        return [self._end(key, END_OF_INPUT) for key in list(self.flows)]
