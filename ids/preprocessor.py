@@ -7,8 +7,9 @@ Thêm vào mỗi event:
                         invalid  thiếu hoặc sai trường bắt buộc: thời gian, địa chỉ IP, port.
                                  Flow Tracker không biết gói xảy ra lúc nào, giữa ai với ai.
     reason              danh sách lý do, [] khi valid
-    norm                giá trị đã chuẩn hóa: tên giao thức viết đúng chuẩn, IP dạng chuẩn,
-                        port là số, tên miền chữ thường. Luôn đủ các khóa; không có thì null.
+    norm                giá trị đã chuẩn hóa: thời gian (epoch và ISO 8601 UTC), tên giao thức
+                        viết đúng chuẩn, IP dạng chuẩn, port là số, tên miền chữ thường, đường
+                        dẫn URI, tên header HTTP. Luôn đủ các khóa; không có thì null.
 
 Không ghi đè dữ liệu gốc của Bài 1. Không bao giờ ném lỗi (mục 2 của đề).
 """
@@ -17,8 +18,10 @@ import ipaddress
 import math
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
+from ids.decoder import percent_decode
 from ids.detector import DNS, HTTP, SMTP, UNKNOWN
 from ids.parsers.network import IP_PROTO_NAMES
 
@@ -36,8 +39,8 @@ SUPPORTED_TRANSPORTS = {"TCP", "UDP"}
 # Viết hoa -> tên chuẩn, để nhận cả "tcp", "Tcp", "ipv4"
 _CANONICAL = {name.upper(): name for name in NETWORKS | TRANSPORTS | APPS}
 
-NORM_FIELDS = ("network", "transport", "app_protocol",
-               "src_ip", "dst_ip", "src_port", "dst_port", "domain")
+NORM_FIELDS = ("timestamp", "time", "network", "transport", "app_protocol",
+               "src_ip", "dst_ip", "src_port", "dst_port", "domain", "uri_path", "http_headers")
 
 
 @dataclass
@@ -139,15 +142,105 @@ def _event_domain(event: dict) -> str | None:
     return None
 
 
-def _timestamp(value: Any, max_clock_skew: float) -> tuple[float | None, str | None]:
-    """Epoch (giây) -> (timestamp, lỗi)."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None, _bad("timestamp", value)
-    if not math.isfinite(value) or value <= 0:
-        return None, f"timestamp ngoài khoảng hợp lệ: {_show(value)}"
-    if value > time.time() + max_clock_skew:
-        return None, f"timestamp ở tương lai: {_show(value)}"
-    return float(value), None
+def _uri_path(uri: Any) -> str | None:
+    """Đường dẫn của URI ở dạng chuẩn, mức an toàn.
+
+    Bỏ query và fragment, gộp nhiều dấu /, xử lý . và .. nhưng không cho vượt lên trên thư mục
+    gốc, giữ dấu / ở cuối. Không đổi chữ hoa/thường vì đường dẫn trên server phân biệt hoa thường.
+        /a//b/./c/../d?x=1  -> /a/b/d
+        /../../etc/passwd   -> /etc/passwd
+    Chỉ xử lý dạng /path và http://host/path; "*" (OPTIONS) hay host:port (CONNECT) không phải
+    đường dẫn nên trả về None.
+    """
+    if not isinstance(uri, str):
+        return None
+    path = uri.split("?", 1)[0].split("#", 1)[0]
+    if "://" in path:                         # Dạng tuyệt đối khi đi qua proxy
+        path = "/" + path.split("://", 1)[1].partition("/")[2]
+    if not path.startswith("/"):
+        return None
+    segments = []
+    for segment in path.split("/"):
+        if segment in ("", "."):
+            continue
+        if segment == "..":
+            if segments:
+                segments.pop()
+            continue
+        segments.append(segment)
+    result = "/" + "/".join(segments)
+    if segments and path.endswith(("/", "/.", "/..")):
+        result += "/"
+    return result
+
+
+def _event_uri_path(event: dict) -> str | None:
+    """Đường dẫn của request HTTP. Ưu tiên URI Decoder đã giải, để %2e%2e cũng được xử lý như .."""
+    decoded = event.get("decoded")
+    if isinstance(decoded, dict) and isinstance(decoded.get("uri"), str):
+        return _uri_path(decoded["uri"])
+    http = event.get("http")
+    request = http.get("request") if isinstance(http, dict) else None
+    if isinstance(request, dict) and isinstance(request.get("uri"), str):
+        return _uri_path(percent_decode(request["uri"]).value)
+    return None
+
+
+def _http_headers(event: dict) -> dict | None:
+    """Header HTTP với tên viết thường, bỏ khoảng trắng thừa (tên header không phân biệt hoa thường)."""
+    http = event.get("http")
+    headers = http.get("headers") if isinstance(http, dict) else None
+    if not isinstance(headers, dict):
+        return None
+    return {str(name).strip().lower(): value for name, value in headers.items()}
+
+
+def _parse_time(value: Any) -> tuple[float | None, str | None]:
+    """Thời điểm -> (epoch giây, ghi chú). None nếu không đọc được.
+
+    Nhận số epoch, số viết dạng chuỗi ("1790400000.5") hoặc chuỗi ISO 8601. ISO không có múi
+    giờ thì coi là UTC, kèm ghi chú.
+    """
+    if isinstance(value, bool):
+        return None, None
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            value = float(text)
+        except ValueError:
+            try:
+                moment = datetime.fromisoformat(text)
+            except ValueError:
+                return None, None
+            if moment.tzinfo is None:
+                return moment.replace(tzinfo=timezone.utc).timestamp(), "thời gian không có múi giờ, coi là UTC"
+            return moment.timestamp(), None
+    if isinstance(value, (int, float)):
+        try:
+            return float(value), None
+        except OverflowError:                  # Số nguyên quá lớn, không đổi được sang float
+            return None, None
+    return None, None
+
+
+def _timestamp(event: dict, max_clock_skew: float) -> tuple[float | None, str | None, list[str]]:
+    """Thời điểm của event -> (epoch giây, lỗi, ghi chú). Thiếu timestamp thì lấy từ trường time."""
+    value = event.get("timestamp")
+    notes = []
+    ts, note = _parse_time(value)
+    if value is None and event.get("time") is not None:
+        ts, note = _parse_time(event["time"])
+        notes.append("thiếu timestamp, lấy từ trường time")
+    if note:
+        notes.append(note)
+
+    if ts is None:
+        return None, _bad("timestamp", value), notes
+    if not math.isfinite(ts) or ts <= 0:
+        return None, f"timestamp ngoài khoảng hợp lệ: {_show(value)}", notes
+    if ts > time.time() + max_clock_skew:
+        return None, f"timestamp ở tương lai: {_show(value)}", notes
+    return ts, None, notes
 
 
 def _check(event: dict, cfg: PreprocessConfig) -> tuple[list[tuple[str, str]], dict]:
@@ -158,9 +251,13 @@ def _check(event: dict, cfg: PreprocessConfig) -> tuple[list[tuple[str, str]], d
     issues = []
     norm = dict.fromkeys(NORM_FIELDS)
 
-    _, error = _timestamp(event.get("timestamp"), cfg.max_clock_skew)
+    ts, error, notes = _timestamp(event, cfg.max_clock_skew)
     if error:
         issues.append((INVALID, error))
+    issues += [(PARTIAL, note) for note in notes]
+    if ts is not None:
+        norm["timestamp"] = round(ts, 6)
+        norm["time"] = datetime.fromtimestamp(ts, timezone.utc).isoformat()
 
     malformed = bool(event.get("malformed"))
     network = norm["network"] = _protocol(event.get("network"), NETWORKS)
@@ -198,6 +295,8 @@ def _check(event: dict, cfg: PreprocessConfig) -> tuple[list[tuple[str, str]], d
     if app is not None and norm["app_protocol"] is None:
         issues.append((PARTIAL, f"app_protocol không nhận ra: {_show(app)}"))
     norm["domain"] = _event_domain(event)
+    norm["uri_path"] = _event_uri_path(event)
+    norm["http_headers"] = _http_headers(event)
 
     if malformed:
         errors = event.get("errors") or []
