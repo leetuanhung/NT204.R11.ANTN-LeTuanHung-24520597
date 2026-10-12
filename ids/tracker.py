@@ -10,6 +10,9 @@ Mỗi event được gắn thêm:
     flow_direction   "forward" (A -> B, A là bên khởi tạo) hoặc "backward"
     flow_state       trạng thái kết nối TCP sau gói này; None với UDP (không có kết nối)
 
+Thống kê mỗi flow (mục 5.4) có trong Flow.to_dict(). Byte tính theo frame_len (số byte của frame
+bắt được). Bộ đếm cờ TCP của flow UDP là None: UDP không có cờ, ghi 0 sẽ hiểu nhầm là đã đếm.
+
 Trạng thái TCP (mục 5.2), cập nhật theo cờ SYN, ACK, FIN, RST:
     NEW          vừa thấy gói đầu, chưa rõ (ví dụ gói không bật cờ nào của NULL scan)
     HANDSHAKE    đã thấy SYN, đang bắt tay ba bước
@@ -68,17 +71,70 @@ class Flow:
     endpoint_b: Endpoint
     start_time: float
     last_seen: float
+    application_protocol: str | None = None
     packet_count: int = 0
+    byte_count: int = 0
+    forward_packet_count: int = 0
+    forward_byte_count: int = 0
+    backward_packet_count: int = 0
+    backward_byte_count: int = 0
+    syn_count: int = 0
+    ack_count: int = 0
+    fin_count: int = 0
+    rst_count: int = 0
     state: str | None = None        # Trạng thái TCP; None với UDP
     syn_ack_seen: bool = False      # Server đã trả lời SYN/ACK
     fin_forward: bool = False       # A đã gửi FIN
     fin_backward: bool = False      # B đã gửi FIN
     end_reason: str | None = None   # Lý do kết thúc, None khi flow còn hoạt động
 
+    def to_dict(self) -> dict:
+        """Bản ghi flow để ghi ra file, tên trường theo bảng 5.4 của đề."""
+        tcp = self.protocol == "TCP"
+        return {
+            "flow_id": self.flow_id,
+            "protocol": self.protocol,
+            "application_protocol": self.application_protocol,
+            "endpoint_a": {"ip": self.endpoint_a[0], "port": self.endpoint_a[1]},
+            "endpoint_b": {"ip": self.endpoint_b[0], "port": self.endpoint_b[1]},
+            "start_time": round(self.start_time, 6),
+            "last_seen": round(self.last_seen, 6),
+            "duration": round(self.last_seen - self.start_time, 6),
+            "packet_count": self.packet_count,
+            "byte_count": self.byte_count,
+            "forward_packet_count": self.forward_packet_count,
+            "forward_byte_count": self.forward_byte_count,
+            "backward_packet_count": self.backward_packet_count,
+            "backward_byte_count": self.backward_byte_count,
+            "SYN_count": self.syn_count if tcp else None,
+            "ACK_count": self.ack_count if tcp else None,
+            "FIN_count": self.fin_count if tcp else None,
+            "RST_count": self.rst_count if tcp else None,
+            "state": self.state,
+            "end_reason": self.end_reason,
+        }
+
 
 def _queue_name(flow: Flow) -> str:
     """Hàng đợi theo mức timeout: TCP, UDP, hoặc TCP đã đóng."""
     return "closed" if flow.state in TERMINAL_STATES else flow.protocol.lower()
+
+
+def _frame_len(event: dict) -> int:
+    size = event.get("frame_len")
+    return size if isinstance(size, int) and not isinstance(size, bool) and size > 0 else 0
+
+
+def _update_app_protocol(flow: Flow, event: dict) -> None:
+    """Giữ giao thức ứng dụng đầu tiên nhận ra được (HTTP, DNS, SMTP).
+
+    Gói không có payload (SYN, ACK) không đổi gì; UNKNOWN chỉ dùng khi chưa nhận ra giao thức nào.
+    """
+    norm = event.get("norm")
+    app = norm.get("app_protocol") if isinstance(norm, dict) else None
+    if app is None or flow.application_protocol not in (None, "UNKNOWN"):
+        return
+    flow.application_protocol = app
 
 
 def _tcp_flags(event: dict) -> dict:
@@ -246,8 +302,21 @@ class FlowTracker:
 
         direction = FORWARD if src == flow.endpoint_a else BACKWARD
         flow.last_seen = max(flow.last_seen, timestamp)   # Gói đến trễ không kéo lùi thời gian
+        size = _frame_len(event)
         flow.packet_count += 1
+        flow.byte_count += size
+        if direction == FORWARD:
+            flow.forward_packet_count += 1
+            flow.forward_byte_count += size
+        else:
+            flow.backward_packet_count += 1
+            flow.backward_byte_count += size
+        _update_app_protocol(flow, event)
         if protocol == "TCP":
+            flow.syn_count += bool(flags.get("syn"))
+            flow.ack_count += bool(flags.get("ack"))
+            flow.fin_count += bool(flags.get("fin"))
+            flow.rst_count += bool(flags.get("reset"))
             update_tcp_state(flow, flags, direction)
         # Xếp lại cuối hàng; trạng thái mới có thể chuyển flow sang hàng "closed"
         self._queues[_queue_name(flow)][key] = None
