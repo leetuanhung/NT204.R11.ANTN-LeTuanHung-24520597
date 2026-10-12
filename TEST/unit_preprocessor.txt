@@ -1,0 +1,40 @@
+test_default_actions (tests.test_preprocessor.ActionTest.test_default_actions) ... ok
+test_skip_invalid (tests.test_preprocessor.ActionTest.test_skip_invalid) ... ok
+test_skip_unsupported (tests.test_preprocessor.ActionTest.test_skip_unsupported) ... ok
+test_defaults_not_shared_between_events (tests.test_preprocessor.MissingDataTest.test_defaults_not_shared_between_events) ... ok
+test_errors_not_a_list (tests.test_preprocessor.MissingDataTest.test_errors_not_a_list) ... ok
+test_non_dict_input (tests.test_preprocessor.MissingDataTest.test_non_dict_input) ... ok
+test_norm_always_has_every_key (tests.test_preprocessor.MissingDataTest.test_norm_always_has_every_key) ... ok
+test_optional_fields_filled (tests.test_preprocessor.MissingDataTest.test_optional_fields_filled)
+T06: thiếu trường không bắt buộc -> null/[] nhất quán, không exception. ... ok
+test_assignment_1_events_unchanged_in_norm (tests.test_preprocessor.NormalizationTest.test_assignment_1_events_unchanged_in_norm) ... ok
+test_domain_from_dns (tests.test_preprocessor.NormalizationTest.test_domain_from_dns) ... ok
+test_domain_from_host (tests.test_preprocessor.NormalizationTest.test_domain_from_host) ... ok
+test_encoded_traversal_normalized (tests.test_preprocessor.NormalizationTest.test_encoded_traversal_normalized) ... ok
+test_http_header_names (tests.test_preprocessor.NormalizationTest.test_http_header_names) ... ok
+test_ip_forms (tests.test_preprocessor.NormalizationTest.test_ip_forms) ... ok
+test_protocol_number (tests.test_preprocessor.NormalizationTest.test_protocol_number) ... ok
+test_same_meaning_same_norm (tests.test_preprocessor.NormalizationTest.test_same_meaning_same_norm)
+T05: cùng một nội dung, nhiều cách viết -> norm giống nhau. ... ok
+test_timestamp_forms (tests.test_preprocessor.NormalizationTest.test_timestamp_forms) ... ok
+test_timestamp_from_time_field (tests.test_preprocessor.NormalizationTest.test_timestamp_from_time_field) ... ok
+test_timestamp_without_timezone (tests.test_preprocessor.NormalizationTest.test_timestamp_without_timezone) ... ok
+test_uri_path (tests.test_preprocessor.NormalizationTest.test_uri_path) ... ok
+test_all_assignment_1_cases (tests.test_preprocessor.RobustnessTest.test_all_assignment_1_cases) ... ok
+test_random_events_never_raise (tests.test_preprocessor.RobustnessTest.test_random_events_never_raise) ... ok
+test_bad_ports (tests.test_preprocessor.ValidationTest.test_bad_ports) ... ok
+test_bad_timestamps (tests.test_preprocessor.ValidationTest.test_bad_timestamps) ... ok
+test_clock_skew_configurable (tests.test_preprocessor.ValidationTest.test_clock_skew_configurable) ... ok
+test_complete_event_is_valid (tests.test_preprocessor.ValidationTest.test_complete_event_is_valid) ... ok
+test_long_bad_value_shortened (tests.test_preprocessor.ValidationTest.test_long_bad_value_shortened) ... ok
+test_malformed_events_from_assignment_1 (tests.test_preprocessor.ValidationTest.test_malformed_events_from_assignment_1) ... ok
+test_missing_vs_wrong_field (tests.test_preprocessor.ValidationTest.test_missing_vs_wrong_field) ... ok
+test_no_payload_app_protocol_none_is_valid (tests.test_preprocessor.ValidationTest.test_no_payload_app_protocol_none_is_valid) ... ok
+test_unknown_app_protocol (tests.test_preprocessor.ValidationTest.test_unknown_app_protocol) ... ok
+test_unknown_network_name (tests.test_preprocessor.ValidationTest.test_unknown_network_name) ... ok
+test_unsupported_protocols_from_assignment_1 (tests.test_preprocessor.ValidationTest.test_unsupported_protocols_from_assignment_1) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 0.061s
+
+OK
