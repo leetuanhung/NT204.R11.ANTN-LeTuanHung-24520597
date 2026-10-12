@@ -8,6 +8,15 @@ Mỗi event được gắn thêm:
     flow_id          id của flow chứa gói, None nếu gói không thuộc flow nào (không phải TCP/UDP,
                      hoặc thiếu 5-tuple)
     flow_direction   "forward" (A -> B, A là bên khởi tạo) hoặc "backward"
+    flow_state       trạng thái kết nối TCP sau gói này; None với UDP (không có kết nối)
+
+Trạng thái TCP (mục 5.2), cập nhật theo cờ SYN, ACK, FIN, RST:
+    NEW          vừa thấy gói đầu, chưa rõ (ví dụ gói không bật cờ nào của NULL scan)
+    HANDSHAKE    đã thấy SYN, đang bắt tay ba bước
+    ESTABLISHED  bắt tay xong (SYN -> SYN/ACK -> ACK), hoặc bắt gói từ giữa phiên đang chạy
+    CLOSING      một phía đã gửi FIN
+    CLOSED       cả hai phía đã gửi FIN
+    RESET        có RST
 """
 
 import ipaddress
@@ -15,6 +24,10 @@ from dataclasses import dataclass
 
 FORWARD, BACKWARD = "forward", "backward"
 TRACKED_PROTOCOLS = {"TCP", "UDP"}
+
+NEW, HANDSHAKE, ESTABLISHED = "NEW", "HANDSHAKE", "ESTABLISHED"
+CLOSING, CLOSED, RESET = "CLOSING", "CLOSED", "RESET"
+TERMINAL_STATES = {CLOSED, RESET}
 
 Endpoint = tuple[str, int]          # (IP, port)
 FlowKey = tuple[str, Endpoint, Endpoint]
@@ -29,6 +42,43 @@ class Flow:
     start_time: float
     last_seen: float
     packet_count: int = 0
+    state: str | None = None        # Trạng thái TCP; None với UDP
+    syn_ack_seen: bool = False      # Server đã trả lời SYN/ACK
+    fin_forward: bool = False       # A đã gửi FIN
+    fin_backward: bool = False      # B đã gửi FIN
+
+
+def _tcp_flags(event: dict) -> dict:
+    tcp = event.get("tcp")
+    flags = tcp.get("flags") if isinstance(tcp, dict) else None
+    return flags if isinstance(flags, dict) else {}
+
+
+def update_tcp_state(flow: Flow, flags: dict, direction: str) -> None:
+    """Cập nhật trạng thái TCP của flow theo cờ của một gói (kể cả gói không có payload)."""
+    if flow.state in TERMINAL_STATES:
+        return                      # ACK cuối, gói gửi lại sau khi đóng: không mở lại kết nối
+    syn, ack = bool(flags.get("syn")), bool(flags.get("ack"))
+    if flags.get("reset"):
+        flow.state = RESET
+    elif flags.get("fin"):
+        if direction == FORWARD:
+            flow.fin_forward = True
+        else:
+            flow.fin_backward = True
+        flow.state = CLOSED if flow.fin_forward and flow.fin_backward else CLOSING
+    elif flow.state == CLOSING:
+        return                      # Dữ liệu và ACK còn lại trong lúc đóng
+    elif syn:
+        if ack:
+            flow.syn_ack_seen = True
+        if flow.state == NEW:
+            flow.state = HANDSHAKE
+    elif ack:
+        if flow.state == NEW:
+            flow.state = ESTABLISHED      # Bắt gói từ giữa phiên: không thấy bắt tay nhưng đang trao đổi
+        elif flow.state == HANDSHAKE and flow.syn_ack_seen and direction == FORWARD:
+            flow.state = ESTABLISHED
 
 
 def _order(endpoint: Endpoint) -> tuple[int, int, int]:
@@ -66,9 +116,8 @@ def _initiator(event: dict, src: Endpoint, dst: Endpoint) -> tuple[Endpoint, End
       - gói đầu là SYN/ACK: đây là trả lời của server, client ở phía đích
       - gói đầu đi từ port dịch vụ (< 1024) sang port tạm: thường là server trả lời client
     """
-    tcp = event.get("tcp")
-    flags = tcp.get("flags") if isinstance(tcp, dict) else None
-    if isinstance(flags, dict) and flags.get("syn"):
+    flags = _tcp_flags(event)
+    if flags.get("syn"):
         return (dst, src) if flags.get("ack") else (src, dst)
     if src[1] < 1024 <= dst[1]:
         return dst, src
@@ -99,24 +148,37 @@ class FlowTracker:
 
         Trả về các flow đã kết thúc trong lần gọi này để nơi gọi ghi ra.
         """
-        event["flow_id"] = event["flow_direction"] = None
+        event["flow_id"] = event["flow_direction"] = event["flow_state"] = None
         five_tuple = _five_tuple(event)
         if five_tuple is None:
             return []
         protocol, src, dst, timestamp = five_tuple
+        flags = _tcp_flags(event) if protocol == "TCP" else {}
+        finished = []
 
         key = flow_key(protocol, src, dst)
         flow = self.flows.get(key)
+        if flow and flow.state in TERMINAL_STATES and flags.get("syn") and not flags.get("ack"):
+            # SYN mới trên 5-tuple đã đóng: phiên mới dùng lại port, kết thúc flow cũ
+            finished.append(self.flows.pop(key))
+            flow = None
         if flow is None:
             a, b = _initiator(event, src, dst)
             flow = Flow(make_flow_id(key, timestamp), protocol, a, b, timestamp, timestamp)
+            if protocol == "TCP":
+                flow.state = NEW
             self.flows[key] = flow
 
+        direction = FORWARD if src == flow.endpoint_a else BACKWARD
         flow.last_seen = max(flow.last_seen, timestamp)   # Gói đến trễ không kéo lùi thời gian
         flow.packet_count += 1
+        if protocol == "TCP":
+            update_tcp_state(flow, flags, direction)
+
         event["flow_id"] = flow.flow_id
-        event["flow_direction"] = FORWARD if src == flow.endpoint_a else BACKWARD
-        return []
+        event["flow_direction"] = direction
+        event["flow_state"] = flow.state
+        return finished
 
     def flush(self) -> list[Flow]:
         """Kết thúc mọi flow còn lại (hết dữ liệu đầu vào). Trả về các flow đó."""
