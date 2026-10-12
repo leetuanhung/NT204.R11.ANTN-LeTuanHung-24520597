@@ -45,9 +45,15 @@ class PreprocessConfig:
     max_clock_skew: float = MAX_CLOCK_SKEW
 
 
+def _show(value: Any, limit: int = 60) -> str:
+    """repr ngắn gọn để đưa vào reason: giá trị sai có thể rất dài (input độc hại), không chép nguyên."""
+    text = repr(value)
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def _bad(field: str, value: Any) -> str:
     """Lý do cho một trường bắt buộc: phân biệt thiếu (None) với có nhưng sai."""
-    return f"thiếu {field}" if value is None else f"{field} không hợp lệ: {value!r}"
+    return f"thiếu {field}" if value is None else f"{field} không hợp lệ: {_show(value)}"
 
 
 def _protocol(value: Any, names: set[str], numbers: dict[int, str] | None = None) -> str | None:
@@ -138,9 +144,9 @@ def _timestamp(value: Any, max_clock_skew: float) -> tuple[float | None, str | N
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None, _bad("timestamp", value)
     if not math.isfinite(value) or value <= 0:
-        return None, f"timestamp ngoài khoảng hợp lệ: {value!r}"
+        return None, f"timestamp ngoài khoảng hợp lệ: {_show(value)}"
     if value > time.time() + max_clock_skew:
-        return None, f"timestamp ở tương lai: {value!r}"
+        return None, f"timestamp ở tương lai: {_show(value)}"
     return float(value), None
 
 
@@ -190,7 +196,7 @@ def _check(event: dict, cfg: PreprocessConfig) -> tuple[list[tuple[str, str]], d
     app = event.get("app_protocol")
     norm["app_protocol"] = _protocol(app, APPS)
     if app is not None and norm["app_protocol"] is None:
-        issues.append((PARTIAL, f"app_protocol không nhận ra: {app!r}"))
+        issues.append((PARTIAL, f"app_protocol không nhận ra: {_show(app)}"))
     norm["domain"] = _event_domain(event)
 
     if malformed:
