@@ -7,11 +7,16 @@ Thêm vào mỗi event:
                         invalid  thiếu hoặc sai trường bắt buộc: thời gian, địa chỉ IP, port.
                                  Flow Tracker không biết gói xảy ra lúc nào, giữa ai với ai.
     reason              danh sách lý do, [] khi valid
-    norm                giá trị đã chuẩn hóa: thời gian (epoch và ISO 8601 UTC), tên giao thức
+    processing_action   accept   valid, đi tiếp bình thường
+                        mark     partial hoặc invalid: vẫn đi tiếp nhưng đã được đánh dấu
+                        skip     bỏ qua theo cấu hình (skip_invalid, skip_unsupported);
+                                 nơi gọi không đưa event này sang module sau
+    norm              giá trị đã chuẩn hóa: thời gian (epoch và ISO 8601 UTC), tên giao thức
                         viết đúng chuẩn, IP dạng chuẩn, port là số, tên miền chữ thường, đường
                         dẫn URI, tên header HTTP. Luôn đủ các khóa; không có thì null.
 
-Không ghi đè dữ liệu gốc của Bài 1. Không bao giờ ném lỗi (mục 2 của đề).
+Trường chung của event bị thiếu được điền giá trị nhất quán (null, [] hoặc false) như Bài 1.
+Ngoài ra không ghi đè dữ liệu gốc của Bài 1. Không bao giờ ném lỗi (mục 2 của đề).
 """
 
 import ipaddress
@@ -26,6 +31,7 @@ from ids.detector import DNS, HTTP, SMTP, UNKNOWN
 from ids.parsers.network import IP_PROTO_NAMES
 
 VALID, PARTIAL, INVALID = "valid", "partial", "invalid"
+ACCEPT, MARK, SKIP = "accept", "mark", "skip"
 _UNSUPPORTED = "unsupported"   # Mức nội bộ: event đúng nhưng thuộc giao thức không hỗ trợ -> partial
 
 MAX_CLOCK_SKEW = 86400.0       # Giây. Timestamp ở tương lai xa hơn mức này so với đồng hồ máy là sai
@@ -39,6 +45,16 @@ SUPPORTED_TRANSPORTS = {"TCP", "UDP"}
 # Viết hoa -> tên chuẩn, để nhận cả "tcp", "Tcp", "ipv4"
 _CANONICAL = {name.upper(): name for name in NETWORKS | TRANSPORTS | APPS}
 
+# Trường chung của event Bài 1 (xem _new_event trong ids/pipeline.py) và giá trị khi bị thiếu
+EVENT_DEFAULTS = {
+    "packet_id": None, "timestamp": None, "time": None, "source": None, "frame_len": None,
+    "src_ip": None, "dst_ip": None, "src_port": None, "dst_port": None,
+    "network": None, "transport": None, "app_protocol": None, "app_detected_by": None,
+    "malformed": False, "truncated": False, "errors": [],
+}
+# Trường bắt buộc: thiếu thì _check đã báo invalid, không báo thêm là "thiếu trường không bắt buộc"
+_REQUIRED = {"timestamp", "network", "src_ip", "dst_ip", "transport", "src_port", "dst_port"}
+
 NORM_FIELDS = ("timestamp", "time", "network", "transport", "app_protocol",
                "src_ip", "dst_ip", "src_port", "dst_port", "domain", "uri_path", "http_headers")
 
@@ -46,6 +62,8 @@ NORM_FIELDS = ("timestamp", "time", "network", "transport", "app_protocol",
 @dataclass
 class PreprocessConfig:
     max_clock_skew: float = MAX_CLOCK_SKEW
+    skip_invalid: bool = False        # True: bỏ qua event invalid thay vì chỉ đánh dấu
+    skip_unsupported: bool = False    # True: bỏ qua event thuộc giao thức không hỗ trợ (ARP, ICMP...)
 
 
 def _show(value: Any, limit: int = 60) -> str:
@@ -243,6 +261,25 @@ def _timestamp(event: dict, max_clock_skew: float) -> tuple[float | None, str | 
     return ts, None, notes
 
 
+def _fill_missing(event: dict) -> list[tuple[str, str]]:
+    """Điền giá trị mặc định cho trường chung bị thiếu. Trả về danh sách (mức, lý do)."""
+    missing = [field for field in EVENT_DEFAULTS if field not in event]
+    for field in missing:
+        default = EVENT_DEFAULTS[field]
+        event[field] = list(default) if isinstance(default, list) else default   # Không dùng chung list
+    issues = []
+    optional = [field for field in missing if field not in _REQUIRED]
+    if optional:
+        issues.append((PARTIAL, "thiếu trường không bắt buộc: " + ", ".join(optional)))
+
+    if event["errors"] is None:
+        event["errors"] = []
+    elif not isinstance(event["errors"], list):
+        event["errors"] = [str(event["errors"])]
+        issues.append((PARTIAL, "errors không phải danh sách, đã đổi thành danh sách"))
+    return issues
+
+
 def _check(event: dict, cfg: PreprocessConfig) -> tuple[list[tuple[str, str]], dict]:
     """Trả về (danh sách (mức, lý do), các giá trị đã chuẩn hóa).
 
@@ -308,21 +345,34 @@ def _check(event: dict, cfg: PreprocessConfig) -> tuple[list[tuple[str, str]], d
 
 
 def preprocess_event(event: Any, cfg: PreprocessConfig | None = None) -> dict:
-    """Kiểm tra và chuẩn hóa một event, thêm preprocess_status, reason và norm.
+    """Kiểm tra và chuẩn hóa một event, thêm preprocess_status, processing_action, reason và norm.
 
-    Trả về chính event đó. Không ném lỗi.
+    Trả về chính event đó. Không ném lỗi. Nơi gọi bỏ qua event có processing_action = "skip".
     """
     cfg = cfg or PreprocessConfig()
     if not isinstance(event, dict):
         event = {"raw_event": event}      # Ví dụ một dòng JSON Lines là số hay danh sách
     try:
-        issues, norm = _check(event, cfg)
+        issues = _fill_missing(event)
+        checked, norm = _check(event, cfg)
+        issues += checked
     except Exception as exc:
         issues = [(INVALID, f"lỗi nội bộ khi kiểm tra: {type(exc).__name__}: {exc}")]
         norm = dict.fromkeys(NORM_FIELDS)
 
     levels = {level for level, _ in issues}
-    event["preprocess_status"] = INVALID if INVALID in levels else PARTIAL if levels else VALID
+    status = INVALID if INVALID in levels else PARTIAL if levels else VALID
+    if status == VALID:
+        action = ACCEPT
+    elif status == INVALID:
+        action = SKIP if cfg.skip_invalid else MARK
+    elif _UNSUPPORTED in levels and cfg.skip_unsupported:
+        action = SKIP
+    else:
+        action = MARK
+
+    event["preprocess_status"] = status
+    event["processing_action"] = action
     event["reason"] = [message for _, message in issues]
     event["norm"] = norm
     return event
