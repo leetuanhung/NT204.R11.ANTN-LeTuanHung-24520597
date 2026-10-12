@@ -7,6 +7,8 @@ Thêm vào mỗi event:
                         invalid  thiếu hoặc sai trường bắt buộc: thời gian, địa chỉ IP, port.
                                  Flow Tracker không biết gói xảy ra lúc nào, giữa ai với ai.
     reason              danh sách lý do, [] khi valid
+    norm                giá trị đã chuẩn hóa: tên giao thức viết đúng chuẩn, IP dạng chuẩn,
+                        port là số, tên miền chữ thường. Luôn đủ các khóa; không có thì null.
 
 Không ghi đè dữ liệu gốc của Bài 1. Không bao giờ ném lỗi (mục 2 của đề).
 """
@@ -33,6 +35,9 @@ SUPPORTED_TRANSPORTS = {"TCP", "UDP"}
 
 # Viết hoa -> tên chuẩn, để nhận cả "tcp", "Tcp", "ipv4"
 _CANONICAL = {name.upper(): name for name in NETWORKS | TRANSPORTS | APPS}
+
+NORM_FIELDS = ("network", "transport", "app_protocol",
+               "src_ip", "dst_ip", "src_port", "dst_port", "domain")
 
 
 @dataclass
@@ -88,6 +93,46 @@ def _port(value: Any) -> int | None:
     return None
 
 
+def _domain(value: Any) -> str | None:
+    """Tên miền dạng chuẩn: bỏ khoảng trắng, chữ thường, bỏ dấu chấm cuối.
+
+    "WWW.Example.COM." -> "www.example.com". Tên gốc (Bài 1 ghi "<Root>") -> ".".
+    """
+    if not isinstance(value, str):
+        return None
+    name = value.strip().lower()
+    if name in ("<root>", "."):
+        return "."
+    return name.rstrip(".") or None
+
+
+def _host_domain(host: Any) -> str | None:
+    """Header Host -> tên miền. Bỏ port ("example.com:8080"); Host là địa chỉ IP thì không có tên miền."""
+    if not isinstance(host, str):
+        return None
+    host = host.strip()
+    if host.startswith("["):                       # IPv6 dạng [::1]:80
+        return None
+    if host.count(":") == 1:
+        host = host.split(":")[0]
+    if _ip(host)[0] is not None:
+        return None
+    return _domain(host)
+
+
+def _event_domain(event: dict) -> str | None:
+    """Tên miền của event: Host của HTTP, hoặc tên được hỏi trong DNS."""
+    http = event.get("http")
+    if isinstance(http, dict) and http.get("host") is not None:
+        return _host_domain(http["host"])
+    dns = event.get("dns")
+    if isinstance(dns, dict) and isinstance(dns.get("qry"), list) and dns["qry"]:
+        first = dns["qry"][0]
+        if isinstance(first, dict):
+            return _domain(first.get("name"))
+    return None
+
+
 def _timestamp(value: Any, max_clock_skew: float) -> tuple[float | None, str | None]:
     """Epoch (giây) -> (timestamp, lỗi)."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -99,16 +144,20 @@ def _timestamp(value: Any, max_clock_skew: float) -> tuple[float | None, str | N
     return float(value), None
 
 
-def _check(event: dict, cfg: PreprocessConfig) -> list[tuple[str, str]]:
-    """Trả về danh sách (mức, lý do). Mức là INVALID, PARTIAL hoặc _UNSUPPORTED."""
+def _check(event: dict, cfg: PreprocessConfig) -> tuple[list[tuple[str, str]], dict]:
+    """Trả về (danh sách (mức, lý do), các giá trị đã chuẩn hóa).
+
+    Mức là INVALID, PARTIAL hoặc _UNSUPPORTED.
+    """
     issues = []
+    norm = dict.fromkeys(NORM_FIELDS)
 
     _, error = _timestamp(event.get("timestamp"), cfg.max_clock_skew)
     if error:
         issues.append((INVALID, error))
 
     malformed = bool(event.get("malformed"))
-    network = _protocol(event.get("network"), NETWORKS)
+    network = norm["network"] = _protocol(event.get("network"), NETWORKS)
     if network is None:
         issues.append((INVALID, _bad("network", event.get("network"))))
     elif network == UNKNOWN:
@@ -121,24 +170,28 @@ def _check(event: dict, cfg: PreprocessConfig) -> list[tuple[str, str]]:
     else:
         for field in ("src_ip", "dst_ip"):
             ip, note = _ip(event.get(field))
+            norm[field] = ip
             if ip is None:
                 issues.append((INVALID, _bad(field, event.get(field))))
             elif note:
                 issues.append((PARTIAL, f"{field}: {note}"))
 
-        transport = _protocol(event.get("transport"), TRANSPORTS, IP_PROTO_NAMES)
+        transport = norm["transport"] = _protocol(event.get("transport"), TRANSPORTS, IP_PROTO_NAMES)
         if transport is None:
             issues.append((INVALID, _bad("transport", event.get("transport"))))
         elif transport not in SUPPORTED_TRANSPORTS:
             issues.append((_UNSUPPORTED, f"giao thức tầng 4 không hỗ trợ: {transport}"))
         else:
             for field in ("src_port", "dst_port"):
-                if _port(event.get(field)) is None:
+                norm[field] = _port(event.get(field))
+                if norm[field] is None:
                     issues.append((INVALID, _bad(field, event.get(field))))
 
     app = event.get("app_protocol")
-    if app is not None and _protocol(app, APPS) is None:
+    norm["app_protocol"] = _protocol(app, APPS)
+    if app is not None and norm["app_protocol"] is None:
         issues.append((PARTIAL, f"app_protocol không nhận ra: {app!r}"))
+    norm["domain"] = _event_domain(event)
 
     if malformed:
         errors = event.get("errors") or []
@@ -146,20 +199,25 @@ def _check(event: dict, cfg: PreprocessConfig) -> list[tuple[str, str]]:
         issues.append((PARTIAL, f"Bài 1 báo gói hỏng: {detail}" if detail else "Bài 1 báo gói hỏng"))
     if event.get("truncated"):
         issues.append((PARTIAL, "gói bị cắt, thiếu phần cuối"))
-    return issues
+    return issues, norm
 
 
 def preprocess_event(event: Any, cfg: PreprocessConfig | None = None) -> dict:
-    """Kiểm tra một event, thêm preprocess_status và reason. Trả về chính event đó. Không ném lỗi."""
+    """Kiểm tra và chuẩn hóa một event, thêm preprocess_status, reason và norm.
+
+    Trả về chính event đó. Không ném lỗi.
+    """
     cfg = cfg or PreprocessConfig()
     if not isinstance(event, dict):
         event = {"raw_event": event}      # Ví dụ một dòng JSON Lines là số hay danh sách
     try:
-        issues = _check(event, cfg)
+        issues, norm = _check(event, cfg)
     except Exception as exc:
         issues = [(INVALID, f"lỗi nội bộ khi kiểm tra: {type(exc).__name__}: {exc}")]
+        norm = dict.fromkeys(NORM_FIELDS)
 
     levels = {level for level, _ in issues}
     event["preprocess_status"] = INVALID if INVALID in levels else PARTIAL if levels else VALID
     event["reason"] = [message for _, message in issues]
+    event["norm"] = norm
     return event
