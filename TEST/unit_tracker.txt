@@ -1,0 +1,49 @@
+test_bidirectional_same_flow (tests.test_tracker.FlowKeyTest.test_bidirectional_same_flow)
+T08: A->B và B->A cùng 5-tuple đảo chiều -> cùng flow_id, đúng direction. ... ok
+test_both_directions_same_key (tests.test_tracker.FlowKeyTest.test_both_directions_same_key) ... ok
+test_concurrent_flows_not_merged (tests.test_tracker.FlowKeyTest.test_concurrent_flows_not_merged)
+T11: các flow khác endpoint hoặc port không bị gộp nhầm. ... ok
+test_events_without_flow (tests.test_tracker.FlowKeyTest.test_events_without_flow) ... ok
+test_flow_id_format (tests.test_tracker.FlowKeyTest.test_flow_id_format) ... ok
+test_flow_id_stable_across_runs (tests.test_tracker.FlowKeyTest.test_flow_id_stable_across_runs) ... ok
+test_numeric_ip_order (tests.test_tracker.FlowKeyTest.test_numeric_ip_order) ... ok
+test_capture_starts_at_server_reply (tests.test_tracker.InitiatorTest.test_capture_starts_at_server_reply) ... ok
+test_capture_starts_at_syn_ack (tests.test_tracker.InitiatorTest.test_capture_starts_at_syn_ack) ... ok
+test_first_packet_sender (tests.test_tracker.InitiatorTest.test_first_packet_sender) ... ok
+test_every_case_counts_every_tcp_udp_packet (tests.test_tracker.RealDataTest.test_every_case_counts_every_tcp_udp_packet) ... ok
+test_handshake_case_from_assignment_1 (tests.test_tracker.RealDataTest.test_handshake_case_from_assignment_1) ... ok
+test_non_dict_event (tests.test_tracker.RobustnessTest.test_non_dict_event) ... ok
+test_random_events_never_raise (tests.test_tracker.RobustnessTest.test_random_events_never_raise) ... ok
+test_first_known_app_protocol (tests.test_tracker.StatisticsTest.test_first_known_app_protocol) ... ok
+test_full_http_session (tests.test_tracker.StatisticsTest.test_full_http_session)
+T13: nhiều gói hai chiều -> packet/byte/flag counter và duration đúng. ... ok
+test_missing_frame_len_counts_zero_bytes (tests.test_tracker.StatisticsTest.test_missing_frame_len_counts_zero_bytes) ... ok
+test_eviction_across_queues (tests.test_tracker.TableLimitTest.test_eviction_across_queues) ... ok
+test_least_recently_seen_evicted (tests.test_tracker.TableLimitTest.test_least_recently_seen_evicted) ... ok
+test_zero_limit_does_not_hang (tests.test_tracker.TableLimitTest.test_zero_limit_does_not_hang) ... ok
+test_fin_close (tests.test_tracker.TcpStateTest.test_fin_close)
+T09: FIN/ACK hai phía -> CLOSED; ACK cuối không mở lại kết nối. ... ok
+test_handshake_ack_must_come_from_client (tests.test_tracker.TcpStateTest.test_handshake_ack_must_come_from_client) ... ok
+test_midstream_capture (tests.test_tracker.TcpStateTest.test_midstream_capture) ... ok
+test_port_reuse_starts_new_flow (tests.test_tracker.TcpStateTest.test_port_reuse_starts_new_flow) ... ok
+test_reset (tests.test_tracker.TcpStateTest.test_reset)
+T09: RST -> RESET. ... ok
+test_scans (tests.test_tracker.TcpStateTest.test_scans) ... ok
+test_three_way_handshake (tests.test_tracker.TcpStateTest.test_three_way_handshake)
+T07: SYN -> SYN/ACK -> ACK: 1 flow, ESTABLISHED. ... ok
+test_closed_flow_kept_briefly (tests.test_tracker.TimeoutTest.test_closed_flow_kept_briefly) ... ok
+test_exactly_at_timeout_still_active (tests.test_tracker.TimeoutTest.test_exactly_at_timeout_still_active) ... ok
+test_flush (tests.test_tracker.TimeoutTest.test_flush) ... ok
+test_idle_timeout (tests.test_tracker.TimeoutTest.test_idle_timeout)
+T12: flow không có gói mới quá timeout -> hết hạn và bị loại khỏi active table. ... ok
+test_late_packet_does_not_move_time_back (tests.test_tracker.TimeoutTest.test_late_packet_does_not_move_time_back) ... ok
+test_non_flow_packets_advance_clock (tests.test_tracker.TimeoutTest.test_non_flow_packets_advance_clock) ... ok
+test_timeouts_per_protocol (tests.test_tracker.TimeoutTest.test_timeouts_per_protocol) ... ok
+test_dns_query_response (tests.test_tracker.UdpTest.test_dns_query_response)
+T10: DNS UDP hai chiều -> 1 flow, packet/byte count đúng. ... ok
+test_udp_has_no_tcp_counters (tests.test_tracker.UdpTest.test_udp_has_no_tcp_counters) ... ok
+
+----------------------------------------------------------------------
+Ran 36 tests in 0.059s
+
+OK
