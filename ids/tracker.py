@@ -9,6 +9,8 @@ Mỗi event được gắn thêm:
                      hoặc thiếu 5-tuple)
     flow_direction   "forward" (A -> B, A là bên khởi tạo) hoặc "backward"
     flow_state       trạng thái kết nối TCP sau gói này; None với UDP (không có kết nối)
+    flow_error       chỉ có khi tracker gặp lỗi không lường trước với gói này (mục 2 của đề:
+                     một gói lỗi không được làm dừng chương trình)
 
 Thống kê mỗi flow (mục 5.4) có trong Flow.to_dict(). Byte tính theo frame_len (số byte của frame
 bắt được). Bộ đếm cờ TCP của flow UDP là None: UDP không có cờ, ghi 0 sẽ hiểu nhầm là đã đếm.
@@ -27,6 +29,7 @@ và xóa khỏi bảng flow đang hoạt động. Đồng hồ là timestamp c�
 """
 
 import ipaddress
+import math
 from collections import OrderedDict
 from dataclasses import dataclass
 
@@ -213,17 +216,37 @@ def _initiator(event: dict, src: Endpoint, dst: Endpoint) -> tuple[Endpoint, End
     return src, dst
 
 
+def _valid_time(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _valid_endpoint(ip: object, port: object) -> bool:
+    """IP parse được và port là số nguyên 0-65535. Event chưa qua Preprocessor có thể sai kiểu."""
+    if not isinstance(ip, str) or isinstance(port, bool) or not isinstance(port, int):
+        return False
+    if not 0 <= port <= 65535:
+        return False
+    try:
+        ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return True
+
+
 def _five_tuple(event: dict) -> tuple[str, Endpoint, Endpoint, float] | None:
     """(protocol, nguồn, đích, timestamp) lấy từ norm, hoặc None nếu gói không thuộc flow nào."""
     norm = event.get("norm")
-    if not isinstance(norm, dict) or norm.get("transport") not in TRACKED_PROTOCOLS:
+    if not isinstance(norm, dict):
+        return None
+    protocol = norm.get("transport")
+    if not isinstance(protocol, str) or protocol not in TRACKED_PROTOCOLS:   # Kiểu lạ như {} không dùng được với "in"
         return None
     src = (norm.get("src_ip"), norm.get("src_port"))
     dst = (norm.get("dst_ip"), norm.get("dst_port"))
     timestamp = norm.get("timestamp")
-    if None in (*src, *dst, timestamp):
+    if not (_valid_endpoint(*src) and _valid_endpoint(*dst) and _valid_time(timestamp)):
         return None
-    return norm["transport"], src, dst, timestamp
+    return protocol, src, dst, float(timestamp)
 
 
 class FlowTracker:
@@ -270,12 +293,23 @@ class FlowTracker:
         """Gắn event vào flow có sẵn hoặc tạo flow mới; thêm flow_id, flow_direction, flow_state.
 
         Trả về các flow đã kết thúc trong lần gọi này (hết hạn, dùng lại port) để nơi gọi ghi ra.
+        Không bao giờ ném lỗi.
         """
+        if not isinstance(event, dict):
+            return []
+        try:
+            return self._process(event)
+        except Exception as exc:
+            # Lưới an toàn cuối cùng, giống ids/pipeline.py: lỗi của một gói không làm dừng chương trình
+            event["flow_error"] = f"{type(exc).__name__}: {exc}"
+            return []
+
+    def _process(self, event: dict) -> list[Flow]:
         event["flow_id"] = event["flow_direction"] = event["flow_state"] = None
         # Mọi gói có thời gian hợp lệ đều đẩy đồng hồ, kể cả gói không thuộc flow nào (ARP, ICMP)
         norm = event.get("norm")
         timestamp = norm.get("timestamp") if isinstance(norm, dict) else None
-        finished = self.expire(timestamp) if isinstance(timestamp, (int, float)) else []
+        finished = self.expire(float(timestamp)) if _valid_time(timestamp) else []
 
         five_tuple = _five_tuple(event)
         if five_tuple is None:
