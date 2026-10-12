@@ -39,10 +39,14 @@ IDLE_TIMEOUT = "idle_timeout"            # Quá thời gian không có gói mớ
 CONNECTION_CLOSED = "connection_closed"  # TCP đã CLOSED/RESET và hết thời gian chờ gói cuối
 PORT_REUSED = "port_reused"              # SYN mới trên 5-tuple của kết nối đã đóng
 END_OF_INPUT = "end_of_input"            # Hết dữ liệu đầu vào (hết file, dừng bắt gói)
+TABLE_FULL = "table_full"                # Bảng flow đầy, nhường chỗ cho flow mới
 
 TCP_TIMEOUT = 300.0     # Giây
 UDP_TIMEOUT = 60.0
 CLOSED_TIMEOUT = 10.0   # Giữ thêm flow đã đóng để ACK cuối, gói gửi lại không tạo nhầm flow mới
+# Số flow đang hoạt động tối đa. SYN flood hay port scan tạo rất nhiều flow; không giới hạn thì
+# kẻ tấn công làm IDS hết bộ nhớ.
+MAX_FLOWS = 65536
 
 
 @dataclass
@@ -50,6 +54,7 @@ class TrackerConfig:
     tcp_timeout: float = TCP_TIMEOUT
     udp_timeout: float = UDP_TIMEOUT
     closed_timeout: float = CLOSED_TIMEOUT
+    max_flows: int = MAX_FLOWS
 
 Endpoint = tuple[str, int]          # (IP, port)
 FlowKey = tuple[str, Endpoint, Endpoint]
@@ -184,6 +189,12 @@ class FlowTracker:
         flow.end_reason = reason
         return flow
 
+    def _evict_oldest(self) -> Flow:
+        """Bảng đầy: kết thúc flow lâu không có gói nhất. Flow đó nằm đầu một trong ba hàng đợi."""
+        fronts = [next(iter(queue)) for queue in self._queues.values() if queue]
+        key = min(fronts, key=lambda k: self.flows[k].last_seen)
+        return self._end(key, TABLE_FULL)
+
     def expire(self, now: float) -> list[Flow]:
         """Kết thúc các flow không có gói mới quá timeout, tính đến thời điểm now."""
         self.now = max(self.now, now)
@@ -223,6 +234,8 @@ class FlowTracker:
             finished.append(self._end(key, PORT_REUSED))
             flow = None
         if flow is None:
+            while len(self.flows) >= max(self.cfg.max_flows, 1):
+                finished.append(self._evict_oldest())
             a, b = _initiator(event, src, dst)
             flow = Flow(make_flow_id(key, timestamp), protocol, a, b, timestamp, timestamp)
             if protocol == "TCP":
